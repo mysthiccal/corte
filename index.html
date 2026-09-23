@@ -93,19 +93,29 @@
     const tracking = document.querySelector('#tracking');
     const notice = document.querySelector('#notice');
     const stylePicker = document.querySelector('#style');
-    let FaceLandmarker, FilesetResolver, landmarker, stream, lastVideoTime = -1, latestFace, hairColor = '#191718', activeStyle = 'curtain', filterError = false;
+    let landmarker, stream, latestFace, hairColor = '#191718', activeStyle = 'curtain', filterError = false, sendingFrame = false;
 
-    const modelUrl = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task';
     function withTimeout(promise, milliseconds) {
       return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('Tiempo de carga agotado')), milliseconds))]);
+    }
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[data-src="${src}"]`)) return resolve();
+        const script = document.createElement('script'); script.src = src; script.async = true; script.crossOrigin = 'anonymous'; script.dataset.src = src;
+        script.onload = resolve; script.onerror = () => reject(new Error('No se pudo descargar el rastreador'));
+        document.head.appendChild(script);
+      });
     }
     async function loadLandmarker() {
       if (landmarker) return landmarker;
       status.textContent = 'Cargando filtro';
       landmarker = await withTimeout((async () => {
-        ({ FaceLandmarker, FilesetResolver } = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22'));
-        const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
-        return FaceLandmarker.createFromOptions(vision, { baseOptions:{ modelAssetPath:modelUrl, delegate:'CPU' }, runningMode:'VIDEO', numFaces:1 });
+        const base = 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619';
+        await loadScript(`${base}/face_mesh.js`);
+        const tracker = new FaceMesh({ locateFile: file => `${base}/${file}` });
+        tracker.setOptions({ maxNumFaces:1, refineLandmarks:false, minDetectionConfidence:.5, minTrackingConfidence:.5 });
+        tracker.onResults(results => { latestFace = results.multiFaceLandmarks?.[0] || null; });
+        return tracker;
       })(), 15000);
       return landmarker;
     }
@@ -156,11 +166,9 @@
       if (canvas.width === 0) resizeCanvas();
       ctx.clearRect(0,0,canvas.width,canvas.height);
       ctx.save(); ctx.translate(canvas.width,0); ctx.scale(-1,1); ctx.drawImage(video,0,0,canvas.width,canvas.height); ctx.restore();
-      if (video.currentTime !== lastVideoTime && landmarker) {
-        try {
-          const result = landmarker.detectForVideo(video, performance.now());
-          latestFace = result.faceLandmarks?.[0]; lastVideoTime = video.currentTime;
-        } catch (error) { filterError = true; landmarker = null; console.error(error); }
+      if (landmarker && !sendingFrame && video.readyState >= 2) {
+        sendingFrame = true;
+        landmarker.send({ image:video }).catch(error => { filterError = true; landmarker = null; console.error(error); }).finally(() => { sendingFrame = false; });
       }
       if (latestFace) { drawers[activeStyle](faceBox(latestFace)); tracking.textContent='Siguiendo tu cara'; }
       else tracking.textContent = filterError ? 'Cámara activa · sin filtro' : 'Busca tu rostro…';
@@ -174,7 +182,7 @@
         stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:1280}},audio:false});
         video.srcObject=stream; await video.play(); resizeCanvas(); empty.classList.add('hide'); capture.disabled=false; cameraButton.textContent='Cámara activa'; status.textContent='Cámara activa'; render();
         try { await loadLandmarker(); status.textContent='En vivo'; }
-        catch (error) { filterError=true; tracking.textContent='Cámara activa · sin filtro'; notice.textContent='La cámara funciona; el filtro no pudo cargar. Recarga con internet e inténtalo de nuevo.'; console.error(error); }
+        catch (error) { filterError=true; tracking.textContent='Cámara activa · sin filtro'; notice.textContent=`No se pudo cargar el filtro: ${error.message}.`; console.error(error); }
       } catch(error) { console.error(error); notice.textContent='No pude abrir la cámara. Revisa el permiso y prueba desde Safari/Chrome con HTTPS.'; status.textContent='Sin acceso'; cameraButton.disabled=false; }
     }
     cameraButton.addEventListener('click',startCamera);
