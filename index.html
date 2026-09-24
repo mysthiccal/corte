@@ -131,7 +131,9 @@
     const fineTuneStorageKey = 'hair-studio-fine-tune-v1';
     let savedFineTune = {};
     try { savedFineTune = JSON.parse(localStorage.getItem(fineTuneStorageKey) || '{}') || {}; } catch { savedFineTune = {}; }
-    let landmarker, stream, latestFace, activeStyle = 'curtain', filterError = false, sendingFrame = false, viewMode = 'auto', smoothedPose, autoProfileActive = false, activeTuneView = 'front';
+    const hairLayer = document.createElement('canvas');
+    const hairCtx = hairLayer.getContext('2d');
+    let detector, detectorMode = 'none', stream, latestFace, latestMatrix, activeStyle = 'curtain', filterError = false, sendingFrame = false, viewMode = 'auto', smoothedPose, autoProfileActive = false, activeTuneView = 'front', lastVideoTime = -1, lastDetectionAt = 0, fallbackStarting = false;
 
     const tuneNames = { curtain:'Curtain', wolf:'Wolf', crop:'French crop', twoBlock:'Two-block' };
     const viewNames = { front:'Frente', left:'Perfil izq.', right:'Perfil der.' };
@@ -170,23 +172,53 @@
         document.head.appendChild(script);
       });
     }
+    async function loadModernLandmarker() {
+      const tasksBase = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1';
+      const vision = await import(tasksBase);
+      const fileset = await vision.FilesetResolver.forVisionTasks(`${tasksBase}/wasm`);
+      return vision.FaceLandmarker.createFromOptions(fileset, {
+        baseOptions:{
+          modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate:'CPU'
+        },
+        runningMode:'VIDEO', numFaces:1, minFaceDetectionConfidence:.5, minFacePresenceConfidence:.5, minTrackingConfidence:.55,
+        outputFaceBlendshapes:false, outputFacialTransformationMatrixes:true
+      });
+    }
+    async function loadLegacyLandmarker() {
+      const base = 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619';
+      await loadScript(`${base}/face_mesh.js`);
+      const tracker = new FaceMesh({ locateFile: file => `${base}/${file}` });
+      tracker.setOptions({ maxNumFaces:1, refineLandmarks:false, minDetectionConfidence:.5, minTrackingConfidence:.5 });
+      tracker.onResults(results => { latestFace = results.multiFaceLandmarks?.[0] || null; latestMatrix = null; });
+      return tracker;
+    }
+    async function startLegacyFallback(reason) {
+      if (fallbackStarting || detectorMode === 'legacy') return;
+      fallbackStarting = true; detectorMode = 'loading'; detector = null; latestMatrix = null;
+      console.warn('Face Landmarker 3D no disponible; usando modo compatible.', reason);
+      try {
+        detector = await withTimeout(loadLegacyLandmarker(), 18000); detectorMode = 'legacy'; filterError = false;
+        status.textContent = 'En vivo · compatible'; notice.textContent = 'Modo compatible activo: el seguimiento 3D no pudo cargar.';
+      } catch (error) {
+        filterError = true; detectorMode = 'none'; notice.textContent = `No se pudo cargar el filtro: ${error.message}.`; console.error(error);
+      } finally { fallbackStarting = false; }
+    }
     async function loadLandmarker() {
-      if (landmarker) return landmarker;
-      status.textContent = 'Cargando filtro';
-      landmarker = await withTimeout((async () => {
-        const base = 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619';
-        await loadScript(`${base}/face_mesh.js`);
-        const tracker = new FaceMesh({ locateFile: file => `${base}/${file}` });
-        tracker.setOptions({ maxNumFaces:1, refineLandmarks:false, minDetectionConfidence:.5, minTrackingConfidence:.5 });
-        tracker.onResults(results => { latestFace = results.multiFaceLandmarks?.[0] || null; });
-        return tracker;
-      })(), 15000);
-      return landmarker;
+      if (detector) return detector;
+      status.textContent = 'Cargando seguimiento 3D'; notice.textContent = 'Preparando el modo 3D… si no es compatible se activará el modo anterior.';
+      try {
+        detector = await withTimeout(loadModernLandmarker(), 22000); detectorMode = 'modern'; filterError = false;
+        status.textContent = 'En vivo · 3D'; notice.textContent = '';
+      } catch (error) { await startLegacyFallback(error); }
+      if (!detector) throw new Error('El detector no pudo iniciar');
+      return detector;
     }
 
     function resizeCanvas() {
       const rect = canvas.getBoundingClientRect(), scale = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.round(rect.width * scale); canvas.height = Math.round(rect.height * scale);
+      hairLayer.width = canvas.width; hairLayer.height = canvas.height;
     }
     function point(lm, i) { return { x:(1-lm[i].x) * canvas.width, y:lm[i].y * canvas.height }; }
     function faceBox(lm) {
@@ -203,9 +235,20 @@
       const noseToA = Math.hypot(nose.x-cheekA.x,nose.y-cheekA.y), noseToB = Math.hypot(nose.x-cheekB.x,nose.y-cheekB.y);
       const distanceTurn=(noseToA-noseToB)/(noseToA+noseToB), templeMid=(templeA.x+templeB.x)/2, templeSpan=Math.max(1,Math.hypot(templeB.x-templeA.x,templeB.y-templeA.y));
       const positionTurn=(nose.x-templeMid)/(templeSpan*.5);
-      const turnOffset = Math.max(-.45, Math.min(.45, distanceTurn*.72+positionTurn*.28));
-      const eyeMidY=(eyeA.y+eyeB.y)/2, pitch=Math.max(-.22,Math.min(.22,((nose.y-eyeMidY)/Math.max(1,chin.y-eyeMidY))-.48));
-      return { ...box, rotation:rotation*.8, turnOffset, pitch, turn:1-Math.abs(turnOffset)*.28, centerX:box.center.x+turnOffset*box.width*.13 };
+      const matrixData = latestMatrix?.data || latestMatrix;
+      let matrixTurn = null, matrixPitch = null;
+      if (matrixData?.length >= 16) {
+        const rawYaw = Math.atan2(matrixData[8], matrixData[10]);
+        const rawPitch = Math.atan2(-matrixData[9], Math.hypot(matrixData[8], matrixData[10]));
+        const direction = Math.sign(positionTurn || distanceTurn || rawYaw || 1);
+        matrixTurn = direction * Math.min(.45, Math.abs(rawYaw) / 1.15);
+        matrixPitch = Math.max(-.22, Math.min(.22, rawPitch * .32));
+      }
+      const landmarkTurn=distanceTurn*.68+positionTurn*.32;
+      const turnOffset = Math.max(-.45, Math.min(.45, matrixTurn == null ? landmarkTurn : landmarkTurn*.35+matrixTurn*.65));
+      const eyeMidY=(eyeA.y+eyeB.y)/2, landmarkPitch=Math.max(-.22,Math.min(.22,((nose.y-eyeMidY)/Math.max(1,chin.y-eyeMidY))-.48));
+      const pitch = matrixPitch == null ? landmarkPitch : landmarkPitch*.4+matrixPitch*.6;
+      return { ...box, rotation:rotation*.8, turnOffset, pitch, pose3D:matrixTurn != null, turn:1-Math.abs(turnOffset)*.28, centerX:box.center.x+turnOffset*box.width*.13 };
     }
     function smoothFacePose(next) {
       if (!smoothedPose) return smoothedPose = next;
@@ -250,37 +293,109 @@
     function drawQuiff(b) {
       curve([[b.left-b.width*.11,b.top+b.height*.39],[b.left-b.width*.02,b.top-b.height*.36],[b.center.x-b.width*.15,b.top-b.height*.66],[b.center.x+b.width*.13,b.top-b.height*.58],[b.right+b.width*.12,b.top-b.height*.20],[b.right+b.width*.13,b.top+b.height*.45],[b.right+b.width*.03,b.top+b.height*.59],[b.center.x+b.width*.12,b.top+b.height*.36],[b.center.x,b.top+b.height*.27],[b.center.x-b.width*.13,b.top+b.height*.38],[b.left-b.width*.04,b.top+b.height*.59],[b.left-b.width*.11,b.top+b.height*.39]]); paint(); hairTexture(b,6);
     }
+    function smoothStep(min,max,value) { const t=Math.max(0,Math.min(1,(value-min)/(max-min))); return t*t*(3-2*t); }
     function resolvedView(b) {
-      if (viewMode === 'front') return { side:false, mirror:false, label:'Frente' };
-      if (viewMode === 'left') return { side:true, mirror:true, label:'Perfil izq.' };
-      if (viewMode === 'right') return { side:true, mirror:false, label:'Perfil der.' };
-      const profileScore = Math.abs(b.turnOffset);
-      if (autoProfileActive ? profileScore < .13 : profileScore > .23) autoProfileActive = !autoProfileActive;
-      return { side:autoProfileActive, mirror:b.turnOffset < 0, label:autoProfileActive ? 'Perfil automático' : 'Frente automático' };
+      if (viewMode === 'front') return { side:false, mirror:false, blend:0, label:'Frente' };
+      if (viewMode === 'left') return { side:true, mirror:true, blend:1, label:'Perfil izq.' };
+      if (viewMode === 'right') return { side:true, mirror:false, blend:1, label:'Perfil der.' };
+      const profileScore = Math.abs(b.turnOffset), blend=smoothStep(.12,.35,profileScore);
+      if (autoProfileActive ? profileScore < .15 : profileScore > .25) autoProfileActive = !autoProfileActive;
+      const label=blend<.25?'Frente automático':blend>.78?'Perfil automático':'Transición de perfil';
+      return { side:autoProfileActive, mirror:b.turnOffset < 0, blend, label };
+    }
+    function rotateAround(point,cx,cy,angle) {
+      const dx=point.x-cx,dy=point.y-cy,c=Math.cos(angle),s=Math.sin(angle);
+      return {x:cx+dx*c-dy*s,y:cy+dx*s+dy*c};
+    }
+    function drawImageTriangle(g,image,s0,s1,s2,d0,d1,d2) {
+      const den=s0.x*(s1.y-s2.y)+s1.x*(s2.y-s0.y)+s2.x*(s0.y-s1.y);
+      if (Math.abs(den)<.0001) return;
+      const a=(d0.x*(s1.y-s2.y)+d1.x*(s2.y-s0.y)+d2.x*(s0.y-s1.y))/den;
+      const b=(d0.y*(s1.y-s2.y)+d1.y*(s2.y-s0.y)+d2.y*(s0.y-s1.y))/den;
+      const c=(d0.x*(s2.x-s1.x)+d1.x*(s0.x-s2.x)+d2.x*(s1.x-s0.x))/den;
+      const d=(d0.y*(s2.x-s1.x)+d1.y*(s0.x-s2.x)+d2.y*(s1.x-s0.x))/den;
+      const e=(d0.x*(s1.x*s2.y-s2.x*s1.y)+d1.x*(s2.x*s0.y-s0.x*s2.y)+d2.x*(s0.x*s1.y-s1.x*s0.y))/den;
+      const f=(d0.y*(s1.x*s2.y-s2.x*s1.y)+d1.y*(s2.x*s0.y-s0.x*s2.y)+d2.y*(s0.x*s1.y-s1.x*s0.y))/den;
+      g.save(); g.beginPath(); g.moveTo(d0.x,d0.y); g.lineTo(d1.x,d1.y); g.lineTo(d2.x,d2.y); g.closePath(); g.clip();
+      g.transform(a,b,c,d,e,f); g.drawImage(image,0,0); g.restore();
+    }
+    function drawWarpedAsset(g,image,{x,y,width,height,rotation,perspective,mirror,alpha,anchorY}) {
+      const columns=5,rows=4,points=[];
+      for(let row=0;row<=rows;row++) {
+        const v=row/rows;
+        for(let column=0;column<=columns;column++) {
+          const u=column/columns,local=u-.5,edge=1-Math.min(1,Math.abs(local)*2),curve=edge*edge;
+          const squeeze=1-Math.abs(perspective)*.16;
+          const px=x+local*width*squeeze+perspective*width*.065*curve;
+          const py=y+v*height+perspective*local*height*.055-Math.abs(perspective)*height*.012*curve;
+          points.push({
+            source:{x:(mirror?1-u:u)*image.naturalWidth,y:v*image.naturalHeight},
+            destination:rotateAround({x:px,y:py},x,anchorY,rotation)
+          });
+        }
+      }
+      const at=(row,column)=>points[row*(columns+1)+column];
+      g.save(); g.globalAlpha=alpha;
+      for(let row=0;row<rows;row++) for(let column=0;column<columns;column++) {
+        const p00=at(row,column),p10=at(row,column+1),p01=at(row+1,column),p11=at(row+1,column+1);
+        drawImageTriangle(g,image,p00.source,p10.source,p11.source,p00.destination,p10.destination,p11.destination);
+        drawImageTriangle(g,image,p00.source,p11.source,p01.source,p00.destination,p11.destination,p01.destination);
+      }
+      g.restore();
+    }
+    function drawHairAsset(g,b,type,alpha,mirror) {
+      const image=hairAssets[activeStyle][type];
+      if (!image?.complete || !image.naturalWidth || alpha<=.01) return false;
+      const tuneView=type==='front'?'front':(mirror?'left':'right'),tune=getFineTune(activeStyle,tuneView),placement=assetPlacement[activeStyle][type];
+      const width=b.width*placement.width*(tune.scale/100),height=width*(image.naturalHeight/image.naturalWidth);
+      const y=b.top+b.height*.04-height*placement.top+b.width*(tune.y/100)+b.pitch*b.height*.10;
+      const centerX=(type==='side'?b.center.x+(mirror ? .28 : -.28)*width:b.centerX)+b.width*(tune.x/100);
+      const perspective=type==='front'?Math.max(-1,Math.min(1,b.turnOffset/.45)):(mirror?-.14:.14);
+      drawWarpedAsset(g,image,{x:centerX,y,width,height,rotation:b.rotation,perspective,mirror:type==='side'&&mirror,alpha:.98*alpha,anchorY:b.center.y});
+      return true;
+    }
+    const faceOval=[10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+    function applyFaceOcclusion(g,b,lm) {
+      if (!lm) return;
+      const cutoff=b.top+b.height*.31;
+      g.save(); g.beginPath(); g.rect(0,cutoff,hairLayer.width,hairLayer.height-cutoff); g.clip(); g.globalCompositeOperation='destination-out';
+      g.beginPath(); faceOval.forEach((index,i)=>{const p=point(lm,index); i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y);}); g.closePath(); g.fillStyle='#000'; g.fill(); g.restore();
     }
     function drawRealHair(b) {
-      const view = resolvedView(b), image = hairAssets[activeStyle][view.side ? 'side' : 'front'];
-      if (!image?.complete || !image.naturalWidth) return;
-      const tuneView = tuneViewFromResolved(view);
-      if (viewMode === 'auto') selectTuneView(tuneView);
-      const tune = getFineTune(activeStyle, tuneView);
-      const placement = assetPlacement[activeStyle][view.side ? 'side' : 'front'], width = b.width * placement.width * (tune.scale / 100);
-      const height = width * (image.naturalHeight / image.naturalWidth);
-      const y = b.top + b.height * .04 - height * placement.top + b.width * (tune.y / 100) + b.pitch * b.height * .10;
-      const centerX = (view.side ? b.center.x + (view.mirror ? .28 : -.28) * width : b.centerX) + b.width * (tune.x / 100);
-      ctx.save(); ctx.globalAlpha=.98; ctx.translate(centerX,b.center.y); ctx.rotate(b.rotation); ctx.scale(view.side ? (view.mirror ? -1 : 1) : b.turn,1); ctx.drawImage(image, -width/2, y-b.center.y, width, height); ctx.restore();
+      const view=resolvedView(b);
+      if (viewMode==='auto') selectTuneView(tuneViewFromResolved(view));
+      hairCtx.clearRect(0,0,hairLayer.width,hairLayer.height);
+      drawHairAsset(hairCtx,b,'front',1-view.blend,false);
+      drawHairAsset(hairCtx,b,'side',view.blend,view.mirror);
+      applyFaceOcclusion(hairCtx,b,latestFace);
+      ctx.drawImage(hairLayer,0,0);
       return view;
+    }
+    function runDetectionFrame() {
+      if (!detector || video.readyState<2) return;
+      if (detectorMode==='modern') {
+        const now=performance.now();
+        if (video.currentTime===lastVideoTime || now-lastDetectionAt<38) return;
+        lastVideoTime=video.currentTime; lastDetectionAt=now;
+        try {
+          const result=detector.detectForVideo(video,now);
+          latestFace=result.faceLandmarks?.[0]||null;
+          latestMatrix=result.facialTransformationMatrixes?.[0]||null;
+        } catch (error) { startLegacyFallback(error); }
+        return;
+      }
+      if (detectorMode==='legacy' && !sendingFrame) {
+        sendingFrame=true;
+        detector.send({image:video}).catch(error=>{filterError=true; detector=null; detectorMode='none'; console.error(error);}).finally(()=>{sendingFrame=false;});
+      }
     }
     function render() {
       if (!video.videoWidth) return requestAnimationFrame(render);
       if (canvas.width === 0) resizeCanvas();
       ctx.clearRect(0,0,canvas.width,canvas.height);
       ctx.save(); ctx.translate(canvas.width,0); ctx.scale(-1,1); ctx.drawImage(video,0,0,canvas.width,canvas.height); ctx.restore();
-      if (landmarker && !sendingFrame && video.readyState >= 2) {
-        sendingFrame = true;
-        landmarker.send({ image:video }).catch(error => { filterError = true; landmarker = null; console.error(error); }).finally(() => { sendingFrame = false; });
-      }
-      if (latestFace) { const view=drawRealHair(smoothFacePose(facePose(latestFace))); tracking.textContent=view?.label || 'Siguiendo tu cara'; }
+      runDetectionFrame();
+      if (latestFace) { const pose=smoothFacePose(facePose(latestFace)),view=drawRealHair(pose); tracking.textContent=`${pose.pose3D?'3D · ':''}${view?.label || 'Siguiendo tu cara'}`; }
       else { smoothedPose=undefined; autoProfileActive=false; tracking.textContent = filterError ? 'Cámara activa · sin filtro' : 'Busca tu rostro…'; }
       requestAnimationFrame(render);
     }
@@ -291,7 +406,7 @@
         status.textContent='Solicitando cámara';
         stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:1280}},audio:false});
         video.srcObject=stream; await video.play(); resizeCanvas(); empty.classList.add('hide'); capture.disabled=false; cameraButton.textContent='Cámara activa'; status.textContent='Cámara activa'; render();
-        try { await loadLandmarker(); status.textContent='En vivo'; }
+        try { await loadLandmarker(); }
         catch (error) { filterError=true; tracking.textContent='Cámara activa · sin filtro'; notice.textContent=`No se pudo cargar el filtro: ${error.message}.`; console.error(error); }
       } catch(error) { console.error(error); notice.textContent='No pude abrir la cámara. Revisa el permiso y prueba desde Safari/Chrome con HTTPS.'; status.textContent='Sin acceso'; cameraButton.disabled=false; }
     }
